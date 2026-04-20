@@ -1,348 +1,202 @@
-#include "tile.h"
+#include <assert.h>
 #include <stdio.h>
 #include <string.h>
-#include <assert.h>
-#include <math.h>
+#include "tile.h"
 
-static int tests_passed = 0;
-static int tests_failed = 0;
+#define TEST(name) printf("  %s... ", name); 
+#define PASS() printf("PASS\n")
 
-#define TEST(name) void test_##name(void)
-#define RUN(name) do { printf("  test_%s... ", #name); test_##name(); printf("OK\n"); tests_passed++; } while(0)
-#define ASSERT_EQ(a, b) do { if ((a) != (b)) { printf("FAIL: %s != %s (%d vs %d)\n", #a, #b, (int)(a), (int)(b)); tests_failed++; return; } } while(0)
-#define ASSERT_TRUE(x) do { if (!(x)) { printf("FAIL: %s is false\n", #x); tests_failed++; return; } } while(0)
-#define ASSERT_FALSE(x) do { if ((x)) { printf("FAIL: %s is true\n", #x); tests_failed++; return; } } while(0)
-#define ASSERT_NEAR(a, b, eps) do { float _a=(a), _b=(b); if (fabsf(_a-_b) > (eps)) { printf("FAIL: %s != %s (%.6f vs %.6f)\n", #a, #b, _a, _b); tests_failed++; return; } } while(0)
-
-/* ---- Lifecycle Tests ---- */
-
-TEST(init_defaults) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    ASSERT_EQ(t.id, 0);
-    ASSERT_EQ(t.domain, TILE_DOMAIN_UNKNOWN);
-    ASSERT_EQ(t.status, TILE_STATUS_ACTIVE);
-    ASSERT_NEAR(t.weight, 1.0f, 0.001f);
-    ASSERT_NEAR(t.belief, 0.0f, 0.001f);
-    ASSERT_EQ(t.tag_count, 0);
+static void test_init_validate(void) {
+    TEST("init and validate");
+    PlatoTile t;
+    TileError e = tile_init(&t, "tile-1", "harbor", "Hello world");
+    assert(e == TILE_OK);
+    assert(strcmp(t.id, "tile-1") == 0);
+    assert(t.state == TILE_DRAFT);
+    assert(t.version == 1);
+    assert(t.tag_count == 0);
+    assert(t.access_count == 0);
+    e = tile_validate(&t);
+    assert(e == TILE_OK);
+    PASS();
 }
 
-TEST(generate_id_unique) {
-    tile_id_t id1 = plato_tile_generate_id();
-    tile_id_t id2 = plato_tile_generate_id();
-    ASSERT_TRUE(id1 != id2);
-    ASSERT_TRUE(id1 != 0);
-    ASSERT_TRUE(id2 != 0);
+static void test_null_checks(void) {
+    TEST("null safety");
+    assert(tile_init(NULL, "a", "b", "c") == TILE_ERR_NULL);
+    assert(tile_validate(NULL) == TILE_ERR_NULL);
+    PlatoTile t;
+    assert(tile_init(&t, "", "room", "content") == TILE_ERR_ID_EMPTY);
+    assert(tile_init(&t, "id", "", "content") == TILE_ERR_ROOM_EMPTY);
+    PASS();
 }
 
-TEST(generate_id_many_unique) {
-    tile_id_t ids[100];
-    int all_unique = 1;
-    for (int i = 0; i < 100; i++) {
-        ids[i] = plato_tile_generate_id();
-    }
-    for (int i = 0; i < 100 && all_unique; i++) {
-        for (int j = i+1; j < 100 && all_unique; j++) {
-            if (ids[i] == ids[j]) all_unique = 0;
-        }
-    }
-    ASSERT_TRUE(all_unique);
+static void test_tags(void) {
+    TEST("tags add/remove/has");
+    PlatoTile t;
+    tile_init(&t, "t1", "room", "content");
+    assert(tile_add_tag(&t, "python") == TILE_OK);
+    assert(tile_add_tag(&t, "rust") == TILE_OK);
+    assert(t.tag_count == 2);
+    assert(tile_has_tag(&t, "python"));
+    assert(!tile_has_tag(&t, "cpp"));
+    assert(tile_add_tag(&t, "python") == TILE_OK); /* duplicate no-op */
+    assert(t.tag_count == 2);
+    tile_remove_tag(&t, "python");
+    assert(t.tag_count == 1);
+    assert(!tile_has_tag(&t, "python"));
+    PASS();
 }
 
-TEST(hash_content_deterministic) {
-    tile_id_t h1 = plato_tile_hash_content("hello world", 11);
-    tile_id_t h2 = plato_tile_hash_content("hello world", 11);
-    ASSERT_EQ(h1, h2);
+static void test_state_lifecycle(void) {
+    TEST("state lifecycle");
+    PlatoTile t;
+    tile_init(&t, "t2", "room", "content");
+    assert(tile_set_state(&t, TILE_ACTIVE) == TILE_OK);
+    assert(t.state == TILE_ACTIVE);
+    assert(tile_set_state(&t, TILE_PINNED) == TILE_OK);
+    assert(tile_set_state(&t, TILE_DEPRECATED) == TILE_OK);
+    assert(tile_set_state(&t, TILE_ARCHIVED) == TILE_OK);
+    assert(tile_set_state(&t, TILE_DELETED) == TILE_OK);
+    PASS();
 }
 
-TEST(hash_content_different) {
-    tile_id_t h1 = plato_tile_hash_content("hello", 5);
-    tile_id_t h2 = plato_tile_hash_content("world", 5);
-    ASSERT_TRUE(h1 != h2);
+static void test_content_version(void) {
+    TEST("content update bumps version");
+    PlatoTile t;
+    tile_init(&t, "t3", "room", "v1");
+    assert(t.version == 1);
+    tile_set_content(&t, "v2");
+    assert(t.version == 2);
+    tile_set_content(&t, "v3");
+    assert(t.version == 3);
+    PASS();
 }
 
-/* ---- Tag Tests ---- */
-
-TEST(add_tag_basic) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    ASSERT_TRUE(plato_tile_add_tag(&t, "constraint"));
-    ASSERT_EQ(t.tag_count, 1);
+static void test_touch(void) {
+    TEST("touch updates access");
+    PlatoTile t;
+    tile_init(&t, "t4", "room", "content");
+    assert(t.access_count == 0);
+    tile_touch(&t);
+    assert(t.access_count == 1);
+    tile_touch(&t);
+    assert(t.access_count == 2);
+    PASS();
 }
 
-TEST(add_tag_duplicate) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    plato_tile_add_tag(&t, "constraint");
-    ASSERT_FALSE(plato_tile_add_tag(&t, "constraint"));
-    ASSERT_EQ(t.tag_count, 1);
+static void test_hash(void) {
+    TEST("hash computation");
+    PlatoTile t1, t2;
+    tile_init(&t1, "t5", "room", "same content");
+    tile_init(&t2, "t6", "room", "same content");
+    assert(strcmp(t1.hash, t2.hash) == 0); /* same content = same hash */
+    tile_set_content(&t2, "different");
+    assert(strcmp(t1.hash, t2.hash) != 0);
+    PASS();
 }
 
-TEST(add_tag_max) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    int added = 0;
-    char buf[32];
-    for (int i = 0; i < 20; i++) {
-        snprintf(buf, sizeof(buf), "tag%d", i);
-        if (plato_tile_add_tag(&t, buf)) added++;
-    }
-    ASSERT_EQ(added, TILE_TAGS_MAX);
-    ASSERT_EQ(t.tag_count, TILE_TAGS_MAX);
+static void test_collection_stats(void) {
+    TEST("collection stats");
+    PlatoTile tiles[3];
+    tile_init(&tiles[0], "a", "room", "c1");
+    tile_init(&tiles[1], "b", "room", "c2");
+    tile_init(&tiles[2], "c", "room", "c3");
+    tiles[0].confidence = 1.0f;
+    tiles[1].confidence = 0.5f;
+    tiles[2].confidence = 0.0f;
+    tile_set_state(&tiles[0], TILE_ACTIVE);
+    tile_set_state(&tiles[1], TILE_ACTIVE);
+    tile_set_state(&tiles[2], TILE_DRAFT);
+    TileStats stats;
+    tile_collection_stats(tiles, 3, &stats);
+    assert(stats.total == 3);
+    assert(stats.by_state[TILE_ACTIVE] == 2);
+    assert(stats.by_state[TILE_DRAFT] == 1);
+    assert(stats.avg_confidence == 0.5f);
+    PASS();
 }
 
-TEST(has_tag) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    plato_tile_add_tag(&t, "flux");
-    plato_tile_add_tag(&t, "trust");
-    ASSERT_TRUE(plato_tile_has_tag(&t, "flux"));
-    ASSERT_TRUE(plato_tile_has_tag(&t, "trust"));
-    ASSERT_FALSE(plato_tile_has_tag(&t, "missing"));
+static void test_collection_filter(void) {
+    TEST("collection filter by state/type/room/tag");
+    PlatoTile tiles[3];
+    tile_init(&tiles[0], "a", "harbor", "c1");
+    tile_init(&tiles[1], "b", "tavern", "c2");
+    tile_init(&tiles[2], "c", "harbor", "c3");
+    tile_set_state(&tiles[0], TILE_ACTIVE);
+    tile_set_state(&tiles[1], TILE_ACTIVE);
+    tile_set_state(&tiles[2], TILE_DELETED);
+    tile_add_tag(&tiles[0], "important");
+
+    PlatoTile out[3];
+    uint32_t n = tile_collection_by_state(tiles, 3, TILE_ACTIVE, out, 3);
+    assert(n == 2);
+    n = tile_collection_by_room(tiles, 3, "harbor", out, 3);
+    assert(n == 2);
+    n = tile_collection_by_tag(tiles, 3, "important", out, 3);
+    assert(n == 1);
+    PASS();
 }
 
-/* ---- Scoring Tests ---- */
-
-TEST(compute_belief_basic) {
-    float b = plato_tile_compute_belief(0.8f, 0.6f, 0.4f);
-    /* 0.5*0.8 + 0.3*0.6 + 0.2*0.4 = 0.4 + 0.18 + 0.08 = 0.66 */
-    ASSERT_NEAR(b, 0.66f, 0.01f);
+static void test_collection_search(void) {
+    TEST("collection search");
+    PlatoTile tiles[2];
+    tile_init(&tiles[0], "a", "room", "hello world");
+    tile_init(&tiles[1], "b", "room", "goodbye world");
+    PlatoTile out[2];
+    uint32_t n = tile_collection_search(tiles, 2, "hello", out, 2);
+    assert(n == 1);
+    n = tile_collection_search(tiles, 2, "world", out, 2);
+    assert(n == 2);
+    PASS();
 }
 
-TEST(compute_belief_clamped_high) {
-    float b = plato_tile_compute_belief(2.0f, 2.0f, 2.0f);
-    ASSERT_TRUE(b <= 1.0f);
+static void test_collection_sort(void) {
+    TEST("collection sort by importance");
+    PlatoTile tiles[3];
+    tile_init(&tiles[0], "a", "room", "low");
+    tile_init(&tiles[1], "b", "room", "high");
+    tile_init(&tiles[2], "c", "room", "mid");
+    tiles[0].importance = 0.2f;
+    tiles[1].importance = 0.9f;
+    tiles[2].importance = 0.5f;
+    tile_collection_sort_by_importance(tiles, 3, true);
+    assert(tiles[0].importance >= tiles[1].importance);
+    assert(tiles[1].importance >= tiles[2].importance);
+    PASS();
 }
 
-TEST(compute_belief_clamped_low) {
-    float b = plato_tile_compute_belief(-1.0f, -1.0f, -1.0f);
-    ASSERT_TRUE(b >= 0.0f);
-}
-
-TEST(compute_belief_zero) {
-    float b = plato_tile_compute_belief(0.0f, 0.0f, 0.0f);
-    ASSERT_NEAR(b, 0.0f, 0.001f);
-}
-
-/* ---- Ghost/Afterlife Tests ---- */
-
-TEST(should_ghost_low_weight) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.weight = 0.03f;
-    ASSERT_TRUE(plato_tile_should_ghost(&t, 0.05f));
-}
-
-TEST(should_not_ghost_high_weight) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.weight = 0.5f;
-    ASSERT_FALSE(plato_tile_should_ghost(&t, 0.05f));
-}
-
-TEST(should_not_ghost_exact_threshold) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.weight = 0.05f;
-    ASSERT_FALSE(plato_tile_should_ghost(&t, 0.05f));
-}
-
-TEST(resurrect_ghost) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.status = TILE_STATUS_GHOST;
-    t.weight = 0.01f;
-    ASSERT_TRUE(plato_tile_resurrect(&t, 0.8f));
-    ASSERT_EQ(t.status, TILE_STATUS_ACTIVE);
-    ASSERT_NEAR(t.weight, 0.4f, 0.01f); /* 0.8 * 0.5 */
-    ASSERT_EQ(t.source, TILE_SOURCE_RESURRECT);
-}
-
-TEST(resurrect_non_ghost_fails) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.status = TILE_STATUS_ACTIVE;
-    ASSERT_FALSE(plato_tile_resurrect(&t, 0.8f));
-}
-
-TEST(resurrect_zero_relevance_fails) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.status = TILE_STATUS_GHOST;
-    ASSERT_FALSE(plato_tile_resurrect(&t, 0.0f));
-}
-
-TEST(resurrect_high_relevance_clamped) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.status = TILE_STATUS_GHOST;
-    ASSERT_TRUE(plato_tile_resurrect(&t, 3.0f));
-    ASSERT_TRUE(t.weight <= 1.0f);
-}
-
-/* ---- Serialization Tests ---- */
-
-TEST(serialize_roundtrip) {
-    plato_tile_t t1, t2;
-    plato_tile_init(&t1);
-    t1.id = 42;
-    t1.domain = TILE_DOMAIN_KNOWLEDGE;
-    t1.status = TILE_STATUS_ACTIVE;
-    t1.weight = 0.75f;
-    t1.belief = 0.6f;
-    strcpy(t1.content, "constraint theory proof");
-    t1.content_len = (uint32_t)strlen(t1.content);
-    t1.created_at = 1713400000;
-    t1.use_count = 5;
-    plato_tile_add_tag(&t1, "math");
-    plato_tile_add_tag(&t1, "proof");
-
-    char buf[8192];
-    int len = plato_tile_serialize(&t1, buf, sizeof(buf));
-    ASSERT_TRUE(len > 0);
-
-    ASSERT_TRUE(plato_tile_deserialize(buf, &t2));
-    ASSERT_EQ(t2.id, 42);
-    ASSERT_EQ(t2.domain, TILE_DOMAIN_KNOWLEDGE);
-    ASSERT_EQ(t2.status, TILE_STATUS_ACTIVE);
-    ASSERT_NEAR(t2.weight, 0.75f, 0.001f);
-    ASSERT_NEAR(t2.belief, 0.6f, 0.001f);
-    ASSERT_EQ(strcmp(t2.content, "constraint theory proof"), 0);
-    ASSERT_EQ(t2.use_count, 5);
-    ASSERT_EQ(t2.tag_count, 2);
-    ASSERT_TRUE(plato_tile_has_tag(&t2, "math"));
-    ASSERT_TRUE(plato_tile_has_tag(&t2, "proof"));
-}
-
-TEST(serialize_empty_content) {
-    plato_tile_t t1, t2;
-    plato_tile_init(&t1);
-    t1.id = 1;
-    char buf[8192];
-    plato_tile_serialize(&t1, buf, sizeof(buf));
-    ASSERT_TRUE(plato_tile_deserialize(buf, &t2));
-    ASSERT_EQ(t2.id, 1);
-}
-
-TEST(deserialize_invalid) {
-    plato_tile_t t;
-    ASSERT_FALSE(plato_tile_deserialize(NULL, &t));
-    ASSERT_FALSE(plato_tile_deserialize("", &t));
-    ASSERT_FALSE(plato_tile_deserialize("garbage", &t));
-}
-
-TEST(serialize_preserves_pipes) {
-    plato_tile_t t1, t2;
-    plato_tile_init(&t1);
-    t1.id = 99;
-    strcpy(t1.content, "x | y | z"); /* pipes should survive */
-    t1.content_len = (uint32_t)strlen(t1.content);
-    char buf[8192];
-    plato_tile_serialize(&t1, buf, sizeof(buf));
-    ASSERT_TRUE(plato_tile_deserialize(buf, &t2));
-    ASSERT_EQ(strcmp(t2.content, "x | y | z"), 0);
-}
-
-/* ---- Validation Tests ---- */
-
-TEST(validate_valid) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.id = 1;
-    strcpy(t.content, "test");
-    t.content_len = 4;
-    ASSERT_EQ(plato_tile_validate(&t), 0);
-}
-
-TEST(validate_zero_id) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    strcpy(t.content, "test");
-    ASSERT_TRUE(plato_tile_validate(&t) & TILE_ERR_ZERO_ID);
-}
-
-TEST(validate_empty_content) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.id = 1;
-    ASSERT_TRUE(plato_tile_validate(&t) & TILE_ERR_CONTENT_EMPTY);
-}
-
-TEST(validate_weight_range) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.id = 1;
-    strcpy(t.content, "test");
-    t.weight = 2.0f;
-    ASSERT_TRUE(plato_tile_validate(&t) & TILE_ERR_WEIGHT_RANGE);
-}
-
-TEST(validate_belief_range) {
-    plato_tile_t t;
-    plato_tile_init(&t);
-    t.id = 1;
-    strcpy(t.content, "test");
-    t.belief = -0.5f;
-    ASSERT_TRUE(plato_tile_validate(&t) & TILE_ERR_BELIEF_RANGE);
-}
-
-/* ---- Struct Size Tests ---- */
-
-TEST(struct_size_reasonable) {
-    /* The struct should be stack-allocatable but not wasteful */
-    size_t sz = sizeof(plato_tile_t);
-    printf("(size=%zu) ", sz);
-    ASSERT_TRUE(sz < 10000);  /* should be under 10KB */
-    ASSERT_TRUE(sz > 4000);   /* should have content buffer */
+static void test_type_operations(void) {
+    TEST("type set and filter");
+    PlatoTile tiles[3];
+    tile_init(&tiles[0], "a", "room", "fact");
+    tile_init(&tiles[1], "b", "room", "rule");
+    tile_init(&tiles[2], "c", "room", "another fact");
+    tile_set_type(&tiles[0], TILE_FACT);
+    tile_set_type(&tiles[1], TILE_RULE);
+    tile_set_type(&tiles[2], TILE_FACT);
+    PlatoTile out[3];
+    uint32_t n = tile_collection_by_type(tiles, 3, TILE_FACT, out, 3);
+    assert(n == 2);
+    n = tile_collection_by_type(tiles, 3, TILE_RULE, out, 3);
+    assert(n == 1);
+    PASS();
 }
 
 int main(void) {
-    printf("=== plato-tile-spec-c Tests ===\n");
-
-    printf("Lifecycle:\n");
-    RUN(init_defaults);
-    RUN(generate_id_unique);
-    RUN(generate_id_many_unique);
-    RUN(hash_content_deterministic);
-    RUN(hash_content_different);
-
-    printf("Tags:\n");
-    RUN(add_tag_basic);
-    RUN(add_tag_duplicate);
-    RUN(add_tag_max);
-    RUN(has_tag);
-
-    printf("Scoring:\n");
-    RUN(compute_belief_basic);
-    RUN(compute_belief_clamped_high);
-    RUN(compute_belief_clamped_low);
-    RUN(compute_belief_zero);
-
-    printf("Ghost/Afterlife:\n");
-    RUN(should_ghost_low_weight);
-    RUN(should_not_ghost_high_weight);
-    RUN(should_not_ghost_exact_threshold);
-    RUN(resurrect_ghost);
-    RUN(resurrect_non_ghost_fails);
-    RUN(resurrect_zero_relevance_fails);
-    RUN(resurrect_high_relevance_clamped);
-
-    printf("Serialization:\n");
-    RUN(serialize_roundtrip);
-    RUN(serialize_empty_content);
-    RUN(deserialize_invalid);
-    RUN(serialize_preserves_pipes);
-
-    printf("Validation:\n");
-    RUN(validate_valid);
-    RUN(validate_zero_id);
-    RUN(validate_empty_content);
-    RUN(validate_weight_range);
-    RUN(validate_belief_range);
-
-    printf("Struct:\n");
-    RUN(struct_size_reasonable);
-
-    printf("\n=== Results: %d passed, %d failed ===\n", tests_passed, tests_failed);
-    return tests_failed > 0 ? 1 : 0;
+    printf("=== plato-tile-spec-c tests ===\n");
+    test_init_validate();
+    test_null_checks();
+    test_tags();
+    test_state_lifecycle();
+    test_content_version();
+    test_touch();
+    test_hash();
+    test_collection_stats();
+    test_collection_filter();
+    test_collection_search();
+    test_collection_sort();
+    test_type_operations();
+    printf("\nAll tests passed!\n");
+    return 0;
 }

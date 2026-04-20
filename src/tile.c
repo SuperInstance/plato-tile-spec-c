@@ -1,176 +1,229 @@
-#define _POSIX_C_SOURCE 199309L
 #include "tile.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
-#include <time.h>
+#include <ctype.h>
 
-/* ---- Internal: FNV-1a hash ---- */
-static uint64_t fnv1a(const char *data, size_t len) {
-    uint64_t hash = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; i++) {
-        hash ^= (uint64_t)(unsigned char)data[i];
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-/* ---- ID Generation ---- */
-static uint64_t id_counter = 0;
-
-tile_id_t plato_tile_generate_id(void) {
+static uint64_t now_ms(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-    __sync_fetch_and_add(&id_counter, 1);
-    return ns ^ (id_counter * 0x9E3779B97F4A7C15ULL);
+    timespec_get(&ts, TIME_UTC);
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-tile_id_t plato_tile_hash_content(const char *content, uint32_t len) {
-    return fnv1a(content, len);
-}
+TileError tile_init(PlatoTile* tile, const char* id, const char* room, const char* content) {
+    if (!tile) return TILE_ERR_NULL;
+    if (!id || !id[0]) return TILE_ERR_ID_EMPTY;
+    if (!room || !room[0]) return TILE_ERR_ROOM_EMPTY;
 
-/* ---- Lifecycle ---- */
-
-void plato_tile_init(plato_tile_t *tile) {
-    memset(tile, 0, sizeof(plato_tile_t));
-    tile->id = 0;
-    tile->domain = TILE_DOMAIN_UNKNOWN;
-    tile->status = TILE_STATUS_ACTIVE;
-    tile->weight = 1.0f;
-    tile->belief = 0.0f;
-    tile->confidence = TILE_CONF_UNKNOWN;
-    tile->source = TILE_SOURCE_UNKNOWN;
-    tile->gene_id = 0;
-    tile->gene_fitness = 0.0f;
-    tile->instinct_trigger = TILE_SOURCE_UNKNOWN;
-    tile->instinct_urgency = 0.0f;
-    tile->tag_count = 0;
-}
-
-/* ---- Tags ---- */
-
-bool plato_tile_add_tag(plato_tile_t *tile, const char *tag) {
-    if (tile->tag_count >= TILE_TAGS_MAX) return false;
-    for (uint8_t i = 0; i < tile->tag_count; i++) {
-        if (strcmp(tile->tags[i], tag) == 0) return false;
+    memset(tile, 0, sizeof(PlatoTile));
+    strncpy(tile->id, id, PLATO_MAX_ID_LEN - 1);
+    strncpy(tile->room, room, PLATO_MAX_ROOM_LEN - 1);
+    if (content) {
+        strncpy(tile->content, content, PLATO_MAX_CONTENT_LEN - 1);
     }
-    size_t tag_len = strlen(tag);
-    if (tag_len >= TILE_TAG_LEN) return false;
-    strcpy(tile->tags[tile->tag_count], tag);
-    tile->tag_count++;
-    return true;
+    tile->type = TILE_FACT;
+    tile->state = TILE_DRAFT;
+    tile->confidence = 0.5f;
+    tile->importance = 0.5f;
+    tile->version = 1;
+    tile->created_at = now_ms();
+    tile->updated_at = tile->created_at;
+    tile->accessed_at = tile->created_at;
+    tile_compute_hash(tile, tile->hash);
+    return TILE_OK;
 }
 
-bool plato_tile_has_tag(const plato_tile_t *tile, const char *tag) {
+TileError tile_validate(const PlatoTile* tile) {
+    if (!tile) return TILE_ERR_NULL;
+    if (!tile->id[0]) return TILE_ERR_ID_EMPTY;
+    if (!tile->content[0]) return TILE_ERR_CONTENT_EMPTY;
+    if (strlen(tile->content) >= PLATO_MAX_CONTENT_LEN) return TILE_ERR_CONTENT_TOO_LONG;
+    if (!tile->room[0]) return TILE_ERR_ROOM_EMPTY;
+    if (tile->state > TILE_DELETED) return TILE_ERR_INVALID_STATE;
+    if (tile->type > TILE_NEGATIVE) return TILE_ERR_INVALID_STATE;
+    return TILE_OK;
+}
+
+TileError tile_set_content(PlatoTile* tile, const char* content) {
+    if (!tile || !content) return TILE_ERR_NULL;
+    if (strlen(content) >= PLATO_MAX_CONTENT_LEN) return TILE_ERR_CONTENT_TOO_LONG;
+    strncpy(tile->content, content, PLATO_MAX_CONTENT_LEN - 1);
+    tile->version++;
+    tile->updated_at = now_ms();
+    tile_compute_hash(tile, tile->hash);
+    return TILE_OK;
+}
+
+TileError tile_add_tag(PlatoTile* tile, const char* tag) {
+    if (!tile || !tag) return TILE_ERR_NULL;
+    if (tile->tag_count >= PLATO_MAX_TAGS) return TILE_ERR_TAGS_FULL;
+    /* Check duplicate */
+    for (uint8_t i = 0; i < tile->tag_count; i++) {
+        if (strcmp(tile->tags[i], tag) == 0) return TILE_OK; /* already tagged */
+    }
+    strncpy(tile->tags[tile->tag_count], tag, PLATO_MAX_ID_LEN - 1);
+    tile->tag_count++;
+    tile->updated_at = now_ms();
+    return TILE_OK;
+}
+
+TileError tile_remove_tag(PlatoTile* tile, const char* tag) {
+    if (!tile || !tag) return TILE_ERR_NULL;
+    for (uint8_t i = 0; i < tile->tag_count; i++) {
+        if (strcmp(tile->tags[i], tag) == 0) {
+            /* Shift remaining tags down */
+            for (uint8_t j = i; j < tile->tag_count - 1; j++) {
+                strcpy(tile->tags[j], tile->tags[j + 1]);
+            }
+            tile->tag_count--;
+            tile->updated_at = now_ms();
+            return TILE_OK;
+        }
+    }
+    return TILE_OK; /* tag not found, no-op */
+}
+
+TileError tile_set_state(PlatoTile* tile, TileState state) {
+    if (!tile) return TILE_ERR_NULL;
+    if (state > TILE_DELETED) return TILE_ERR_INVALID_STATE;
+    tile->state = state;
+    tile->updated_at = now_ms();
+    return TILE_OK;
+}
+
+TileError tile_set_type(PlatoTile* tile, TileType type) {
+    if (!tile) return TILE_ERR_NULL;
+    if (type > TILE_NEGATIVE) return TILE_ERR_INVALID_STATE;
+    tile->type = type;
+    tile->updated_at = now_ms();
+    return TILE_OK;
+}
+
+bool tile_has_tag(const PlatoTile* tile, const char* tag) {
+    if (!tile || !tag) return false;
     for (uint8_t i = 0; i < tile->tag_count; i++) {
         if (strcmp(tile->tags[i], tag) == 0) return true;
     }
     return false;
 }
 
-/* ---- Scoring ---- */
-
-float plato_tile_compute_belief(float confidence, float trust, float relevance) {
-    float b = 0.5f * confidence + 0.3f * trust + 0.2f * relevance;
-    if (b < 0.0f) b = 0.0f;
-    if (b > 1.0f) b = 1.0f;
-    return b;
+void tile_touch(PlatoTile* tile) {
+    if (!tile) return;
+    tile->accessed_at = now_ms();
+    tile->access_count++;
 }
 
-float plato_tile_decay_weight(float weight, uint64_t last_used, float lambda) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t now = (uint64_t)ts.tv_sec;
-    uint64_t elapsed = now - last_used;
-    if (elapsed > 86400 * 365) elapsed = 86400 * 365;
-    float decay = expf(-lambda * (float)elapsed);
-    float new_weight = weight * decay;
-    if (new_weight < 0.0f) new_weight = 0.0f;
-    if (new_weight > 1.0f) new_weight = 1.0f;
-    return new_weight;
-}
-
-/* ---- Ghost/Afterlife ---- */
-
-bool plato_tile_should_ghost(const plato_tile_t *tile, float threshold) {
-    if (threshold <= 0.0f) threshold = 0.05f;
-    return tile->weight < threshold;
-}
-
-bool plato_tile_resurrect(plato_tile_t *tile, float relevance) {
-    if (tile->status != TILE_STATUS_GHOST) return false;
-    if (relevance <= 0.0f) return false;
-    tile->status = TILE_STATUS_ACTIVE;
-    tile->weight = relevance * 0.5f;
-    if (tile->weight > 1.0f) tile->weight = 1.0f;
-    tile->source = TILE_SOURCE_RESURRECT;
-    return true;
-}
-
-/* ---- Serialization ---- */
-
-int plato_tile_serialize(const plato_tile_t *tile, char *buf, int buf_size) {
-    if (!buf || buf_size < 256) return 0;
-    char tag_str[TILE_TAGS_MAX * (TILE_TAG_LEN + 1)];
-    tag_str[0] = '\0';
-    for (uint8_t i = 0; i < tile->tag_count; i++) {
-        if (i > 0) strcat(tag_str, ",");
-        strcat(tag_str, tile->tags[i]);
+/* Simple FNV-1a hash for tile content */
+void tile_compute_hash(const PlatoTile* tile, char* out_hash) {
+    if (!tile || !out_hash) return;
+    uint64_t hash = 14695981039346656037ULL;
+    const char* data = tile->content;
+    size_t len = strlen(tile->content);
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (uint64_t)(unsigned char)data[i];
+        hash *= 1099511628211ULL;
     }
-    return snprintf(buf, buf_size, "%lu\t%d\t%d\t%.6f\t%.6f\t%s\t%lu\t%lu\t%u\t%s",
-        (unsigned long)tile->id,
-        (int)tile->domain,
-        (int)tile->status,
-        tile->weight,
-        tile->belief,
-        tile->content,
-        (unsigned long)tile->created_at,
-        (unsigned long)tile->last_used,
-        tile->use_count,
-        tag_str);
+    snprintf(out_hash, PLATO_HASH_LEN + 1, "%016lx", hash);
 }
 
-bool plato_tile_deserialize(const char *buf, plato_tile_t *tile) {
-    if (!buf || !tile) return false;
-    plato_tile_init(tile);
-    int domain_i = 0, status_i = 0;
-    unsigned long created_l = 0, lastused_l = 0;
-    unsigned int use_count_i = 0;
-    char tags_raw[TILE_TAGS_MAX * (TILE_TAG_LEN + 1)] = {0};
-    int matched = sscanf(buf, "%lu\t%d\t%d\t%f\t%f\t%4095[^\t]\t%lu\t%lu\t%u\t%255[^\n]",
-        (unsigned long*)&tile->id, &domain_i, &status_i,
-        &tile->weight, &tile->belief, tile->content,
-        &created_l, &lastused_l, &use_count_i, tags_raw);
-    if (matched < 5) return false;
-    tile->domain = (tile_domain_t)domain_i;
-    tile->status = (tile_status_t)status_i;
-    tile->created_at = created_l;
-    tile->last_used = lastused_l;
-    tile->use_count = use_count_i;
-    tile->content_len = (uint32_t)strlen(tile->content);
-    if (tags_raw[0] != '\0') {
-        char *tok = strtok(tags_raw, ",");
-        while (tok && tile->tag_count < TILE_TAGS_MAX) {
-            plato_tile_add_tag(tile, tok);
-            tok = strtok(NULL, ",");
+/* Collection operations */
+TileError tile_collection_stats(const PlatoTile* tiles, uint32_t count, TileStats* stats) {
+    if (!tiles || !stats) return TILE_ERR_NULL;
+    memset(stats, 0, sizeof(TileStats));
+    stats->total = count;
+    float conf_sum = 0, imp_sum = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        stats->by_state[tiles[i].state]++;
+        stats->by_type[tiles[i].type]++;
+        conf_sum += tiles[i].confidence;
+        imp_sum += tiles[i].importance;
+    }
+    if (count > 0) {
+        stats->avg_confidence = conf_sum / count;
+        stats->avg_importance = imp_sum / count;
+    }
+    return TILE_OK;
+}
+
+uint32_t tile_collection_by_state(const PlatoTile* tiles, uint32_t count, TileState state,
+                                  PlatoTile* out, uint32_t max_out) {
+    if (!tiles || !out) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count && n < max_out; i++) {
+        if (tiles[i].state == state) out[n++] = tiles[i];
+    }
+    return n;
+}
+
+uint32_t tile_collection_by_type(const PlatoTile* tiles, uint32_t count, TileType type,
+                                 PlatoTile* out, uint32_t max_out) {
+    if (!tiles || !out) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count && n < max_out; i++) {
+        if (tiles[i].type == type) out[n++] = tiles[i];
+    }
+    return n;
+}
+
+uint32_t tile_collection_by_room(const PlatoTile* tiles, uint32_t count, const char* room,
+                                 PlatoTile* out, uint32_t max_out) {
+    if (!tiles || !out || !room) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count && n < max_out; i++) {
+        if (strcmp(tiles[i].room, room) == 0) out[n++] = tiles[i];
+    }
+    return n;
+}
+
+uint32_t tile_collection_by_tag(const PlatoTile* tiles, uint32_t count, const char* tag,
+                                PlatoTile* out, uint32_t max_out) {
+    if (!tiles || !out || !tag) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < count && n < max_out; i++) {
+        if (tile_has_tag(&tiles[i], tag)) out[n++] = tiles[i];
+    }
+    return n;
+}
+
+/* Simple substring search */
+uint32_t tile_collection_search(const PlatoTile* tiles, uint32_t count, const char* query,
+                                PlatoTile* out, uint32_t max_out) {
+    if (!tiles || !out || !query) return 0;
+    uint32_t n = 0;
+    size_t qlen = strlen(query);
+    for (uint32_t i = 0; i < count && n < max_out; i++) {
+        if (strcasestr(tiles[i].content, query) || strcasestr(tiles[i].id, query)) {
+            out[n++] = tiles[i];
         }
     }
-    return true;
+    return n;
 }
 
-/* ---- Validation ---- */
+/* Sort helpers */
+static int cmp_importance_desc(const void* a, const void* b) {
+    float diff = ((const PlatoTile*)b)->importance - ((const PlatoTile*)a)->importance;
+    return (diff > 0) ? 1 : (diff < 0) ? -1 : 0;
+}
+static int cmp_confidence_desc(const void* a, const void* b) {
+    float diff = ((const PlatoTile*)b)->confidence - ((const PlatoTile*)a)->confidence;
+    return (diff > 0) ? 1 : (diff < 0) ? -1 : 0;
+}
+static int cmp_accessed_desc(const void* a, const void* b) {
+    uint64_t diff = ((const PlatoTile*)b)->accessed_at - ((const PlatoTile*)a)->accessed_at;
+    return (diff > 0) ? 1 : (diff < 0) ? -1 : 0;
+}
 
-int plato_tile_validate(const plato_tile_t *tile) {
-    int errs = 0;
-    if (tile->id == 0) errs |= TILE_ERR_ZERO_ID;
-    if (tile->weight < -1.0f || tile->weight > 1.0f) errs |= TILE_ERR_WEIGHT_RANGE;
-    if (tile->belief < 0.0f || tile->belief > 1.0f) errs |= TILE_ERR_BELIEF_RANGE;
-    if (tile->content[0] == '\0') errs |= TILE_ERR_CONTENT_EMPTY;
-    if (tile->content_len >= TILE_CONTENT_MAX) errs |= TILE_ERR_CONTENT_LEN;
-    for (uint8_t i = 0; i < tile->tag_count; i++) {
-        if (strlen(tile->tags[i]) >= TILE_TAG_LEN) { errs |= TILE_ERR_TAG_TOO_LONG; break; }
-    }
-    return errs;
+void tile_collection_sort_by_importance(PlatoTile* tiles, uint32_t count, bool descending) {
+    if (!tiles || count < 2) return;
+    qsort(tiles, count, sizeof(PlatoTile), descending ? cmp_importance_desc : NULL);
+}
+
+void tile_collection_sort_by_confidence(PlatoTile* tiles, uint32_t count, bool descending) {
+    if (!tiles || count < 2) return;
+    qsort(tiles, count, sizeof(PlatoTile), descending ? cmp_confidence_desc : NULL);
+}
+
+void tile_collection_sort_by_accessed(PlatoTile* tiles, uint32_t count, bool descending) {
+    if (!tiles || count < 2) return;
+    qsort(tiles, count, sizeof(PlatoTile), descending ? cmp_accessed_desc : NULL);
 }
